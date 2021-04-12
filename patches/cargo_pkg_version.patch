@@ -1,5 +1,5 @@
---- src/connection.rs	2020-12-21 14:55:17.022985801 +0100
-+++ src/connection.rs	2020-12-21 14:55:35.150841529 +0100
+--- a/src/connection.rs	2020-12-21 14:55:17.022985801 +0100
++++ b/src/connection.rs	2020-12-21 14:55:35.150841529 +0100
 @@ -84,9 +84,9 @@
          hello_buf[0..BENCHMARK_MAGIC_NUMBER.len()]
              .copy_from_slice(BENCHMARK_MAGIC_NUMBER.as_bytes());

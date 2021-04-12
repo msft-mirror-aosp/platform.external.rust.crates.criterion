@@ -1,7 +1,10 @@
 use super::*;
 use crate::AxisScale;
 use itertools::Itertools;
-use plotters::coord::{AsRangedCoord, Shift};
+use plotters::coord::{
+    ranged1d::{AsRangedCoord, ValueFormatter as PlottersValueFormatter},
+    Shift,
+};
 use std::cmp::Ordering;
 use std::path::Path;
 
@@ -25,7 +28,7 @@ pub fn line_comparison(
     value_type: ValueType,
     axis_scale: AxisScale,
 ) {
-    let (unit, series_data) = line_comparision_series_data(formatter, all_curves);
+    let (unit, series_data) = line_comparison_series_data(formatter, all_curves);
 
     let x_range =
         plotters::data::fitting_range(series_data.iter().map(|(_, xs, _)| xs.iter()).flatten());
@@ -33,7 +36,7 @@ pub fn line_comparison(
         plotters::data::fitting_range(series_data.iter().map(|(_, _, ys)| ys.iter()).flatten());
     let root_area = SVGBackend::new(&path, SIZE)
         .into_drawing_area()
-        .titled(&format!("{}: Comparision", title), (DEFAULT_FONT, 20))
+        .titled(&format!("{}: Comparison", title), (DEFAULT_FONT, 20))
         .unwrap();
 
     match axis_scale {
@@ -58,7 +61,10 @@ fn draw_line_comarision_figure<XR: AsRangedCoord<Value = f64>, YR: AsRangedCoord
     y_range: YR,
     value_type: ValueType,
     data: Vec<(Option<&String>, Vec<f64>, Vec<f64>)>,
-) {
+) where
+    XR::CoordDescType: PlottersValueFormatter<f64>,
+    YR::CoordDescType: PlottersValueFormatter<f64>,
+{
     let input_suffix = match value_type {
         ValueType::Bytes => " Size (Bytes)",
         ValueType::Elements => " Size (Elements)",
@@ -69,7 +75,7 @@ fn draw_line_comarision_figure<XR: AsRangedCoord<Value = f64>, YR: AsRangedCoord
         .margin((5).percent())
         .set_label_area_size(LabelAreaPosition::Left, (5).percent_width().min(60))
         .set_label_area_size(LabelAreaPosition::Bottom, (5).percent_height().min(40))
-        .build_ranged(x_range, y_range)
+        .build_cartesian_2d(x_range, y_range)
         .unwrap();
 
     chart
@@ -109,7 +115,7 @@ fn draw_line_comarision_figure<XR: AsRangedCoord<Value = f64>, YR: AsRangedCoord
 }
 
 #[allow(clippy::type_complexity)]
-fn line_comparision_series_data<'a>(
+fn line_comparison_series_data<'a>(
     formatter: &dyn ValueFormatter,
     all_curves: &[&(&'a BenchmarkId, Vec<f64>)],
 ) -> (&'static str, Vec<(Option<&'a String>, Vec<f64>, Vec<f64>)>) {
@@ -190,7 +196,9 @@ pub fn violin(
         formatter.scale_values(max, xs);
     });
 
-    let x_range = plotters::data::fitting_range(kdes.iter().map(|(_, xs, _)| xs.iter()).flatten());
+    let mut x_range =
+        plotters::data::fitting_range(kdes.iter().map(|(_, xs, _)| xs.iter()).flatten());
+    x_range.start = 0.0;
     let y_range = -0.5..all_curves.len() as f64 - 0.5;
 
     let size = (960, 150 + (18 * all_curves.len() as u32));
@@ -215,12 +223,15 @@ fn draw_violin_figure<XR: AsRangedCoord<Value = f64>, YR: AsRangedCoord<Value = 
     x_range: XR,
     y_range: YR,
     data: Vec<(&str, Box<[f64]>, Box<[f64]>)>,
-) {
+) where
+    XR::CoordDescType: PlottersValueFormatter<f64>,
+    YR::CoordDescType: PlottersValueFormatter<f64>,
+{
     let mut chart = ChartBuilder::on(&root_area)
         .margin((5).percent())
         .set_label_area_size(LabelAreaPosition::Left, (10).percent_width().min(60))
         .set_label_area_size(LabelAreaPosition::Bottom, (5).percent_width().min(40))
-        .build_ranged(x_range, y_range)
+        .build_cartesian_2d(x_range, y_range)
         .unwrap();
 
     chart
@@ -241,7 +252,7 @@ fn draw_violin_figure<XR: AsRangedCoord<Value = f64>, YR: AsRangedCoord<Value = 
             .draw_series(AreaSeries::new(
                 x.iter().zip(y.iter()).map(|(x, y)| (*x, base + *y / 2.0)),
                 base,
-                &DARK_BLUE.mix(0.25),
+                &DARK_BLUE,
             ))
             .unwrap();
 
@@ -249,7 +260,7 @@ fn draw_violin_figure<XR: AsRangedCoord<Value = f64>, YR: AsRangedCoord<Value = 
             .draw_series(AreaSeries::new(
                 x.iter().zip(y.iter()).map(|(x, y)| (*x, base - *y / 2.0)),
                 base,
-                &DARK_BLUE.mix(0.25),
+                &DARK_BLUE,
             ))
             .unwrap();
     }
