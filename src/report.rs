@@ -1,6 +1,6 @@
-use crate::stats::bivariate::regression::Slope;
-use crate::stats::bivariate::Data;
 use crate::stats::univariate::outliers::tukey::LabeledSample;
+use crate::{csv_report::FileCsvReport, stats::bivariate::regression::Slope};
+use crate::{html::Html, stats::bivariate::Data};
 
 use crate::estimate::{ChangeDistributions, ChangeEstimates, Distributions, Estimate, Estimates};
 use crate::format;
@@ -299,101 +299,68 @@ pub(crate) trait Report {
 }
 
 pub(crate) struct Reports {
-    reports: Vec<Box<dyn Report>>,
+    pub(crate) cli_enabled: bool,
+    pub(crate) cli: CliReport,
+    pub(crate) bencher_enabled: bool,
+    pub(crate) bencher: BencherReport,
+    pub(crate) csv_enabled: bool,
+    pub(crate) csv: FileCsvReport,
+    pub(crate) html_enabled: bool,
+    pub(crate) html: Html,
 }
-impl Reports {
-    pub fn new(reports: Vec<Box<dyn Report>>) -> Reports {
-        Reports { reports }
-    }
+macro_rules! reports_impl {
+    (fn $name:ident(&self, $($argn:ident: $argt:ty),*)) => {
+        fn $name(&self, $($argn: $argt),* ) {
+            if self.cli_enabled {
+                self.cli.$name($($argn),*);
+            }
+            if self.bencher_enabled {
+                self.bencher.$name($($argn),*);
+            }
+            if self.csv_enabled {
+                self.csv.$name($($argn),*);
+            }
+            if self.html_enabled {
+                self.html.$name($($argn),*);
+            }
+        }
+    };
 }
+
 impl Report for Reports {
-    fn test_start(&self, id: &BenchmarkId, context: &ReportContext) {
-        for report in &self.reports {
-            report.test_start(id, context);
-        }
-    }
-    fn test_pass(&self, id: &BenchmarkId, context: &ReportContext) {
-        for report in &self.reports {
-            report.test_pass(id, context);
-        }
-    }
-
-    fn benchmark_start(&self, id: &BenchmarkId, context: &ReportContext) {
-        for report in &self.reports {
-            report.benchmark_start(id, context);
-        }
-    }
-
-    fn profile(&self, id: &BenchmarkId, context: &ReportContext, profile_ns: f64) {
-        for report in &self.reports {
-            report.profile(id, context, profile_ns);
-        }
-    }
-
-    fn warmup(&self, id: &BenchmarkId, context: &ReportContext, warmup_ns: f64) {
-        for report in &self.reports {
-            report.warmup(id, context, warmup_ns);
-        }
-    }
-
-    fn terminated(&self, id: &BenchmarkId, context: &ReportContext) {
-        for report in &self.reports {
-            report.terminated(id, context);
-        }
-    }
-
-    fn analysis(&self, id: &BenchmarkId, context: &ReportContext) {
-        for report in &self.reports {
-            report.analysis(id, context);
-        }
-    }
-
-    fn measurement_start(
+    reports_impl!(fn test_start(&self, id: &BenchmarkId, context: &ReportContext));
+    reports_impl!(fn test_pass(&self, id: &BenchmarkId, context: &ReportContext));
+    reports_impl!(fn benchmark_start(&self, id: &BenchmarkId, context: &ReportContext));
+    reports_impl!(fn profile(&self, id: &BenchmarkId, context: &ReportContext, profile_ns: f64));
+    reports_impl!(fn warmup(&self, id: &BenchmarkId, context: &ReportContext, warmup_ns: f64));
+    reports_impl!(fn terminated(&self, id: &BenchmarkId, context: &ReportContext));
+    reports_impl!(fn analysis(&self, id: &BenchmarkId, context: &ReportContext));
+    reports_impl!(fn measurement_start(
         &self,
         id: &BenchmarkId,
         context: &ReportContext,
         sample_count: u64,
         estimate_ns: f64,
-        iter_count: u64,
-    ) {
-        for report in &self.reports {
-            report.measurement_start(id, context, sample_count, estimate_ns, iter_count);
-        }
-    }
-
+        iter_count: u64
+    ));
+    reports_impl!(
     fn measurement_complete(
         &self,
         id: &BenchmarkId,
         context: &ReportContext,
         measurements: &MeasurementData<'_>,
-        formatter: &dyn ValueFormatter,
-    ) {
-        for report in &self.reports {
-            report.measurement_complete(id, context, measurements, formatter);
-        }
-    }
-
+        formatter: &dyn ValueFormatter
+    ));
+    reports_impl!(
     fn summarize(
         &self,
         context: &ReportContext,
         all_ids: &[BenchmarkId],
-        formatter: &dyn ValueFormatter,
-    ) {
-        for report in &self.reports {
-            report.summarize(context, all_ids, formatter);
-        }
-    }
+        formatter: &dyn ValueFormatter
+    ));
 
-    fn final_summary(&self, context: &ReportContext) {
-        for report in &self.reports {
-            report.final_summary(context);
-        }
-    }
-    fn group_separator(&self) {
-        for report in &self.reports {
-            report.group_separator();
-        }
-    }
+    reports_impl!(fn final_summary(&self, context: &ReportContext));
+    reports_impl!(fn group_separator(&self, ));
 }
 
 pub(crate) struct CliReport {
@@ -428,7 +395,7 @@ impl CliReport {
         }
     }
 
-    //Passing a String is the common case here.
+    // Passing a String is the common case here.
     #[cfg_attr(feature = "cargo-clippy", allow(clippy::needless_pass_by_value))]
     fn print_overwritable(&self, s: String) {
         if self.enable_text_overwrite {
@@ -633,7 +600,7 @@ impl Report for CliReport {
             let point_estimate = mean_est.point_estimate;
             let mut point_estimate_str = format::change(point_estimate, true);
             // The change in throughput is related to the change in timing. Reducing the timing by
-            // 50% increases the througput by 100%.
+            // 50% increases the throughput by 100%.
             let to_thrpt_estimate = |ratio: f64| 1.0 / (1.0 + ratio) - 1.0;
             let mut thrpt_point_estimate_str =
                 format::change(to_thrpt_estimate(point_estimate), true);

@@ -174,6 +174,7 @@ pub fn violin(
         .configure(Axis::BottomX, |a| {
             a.configure(Grid::Major, |g| g.show())
                 .configure(Grid::Minor, |g| g.hide())
+                .set(Range::Limits(0., max as f64 * one[0]))
                 .set(Label(format!("Average time ({})", unit)))
                 .set(axis_scale.to_gnuplot())
         })
@@ -200,9 +201,9 @@ pub fn violin(
             if is_first {
                 is_first = false;
 
-                c.set(DARK_BLUE).set(Label("PDF")).set(Opacity(0.25))
+                c.set(DARK_BLUE).set(Label("PDF"))
             } else {
-                c.set(DARK_BLUE).set(Opacity(0.25))
+                c.set(DARK_BLUE)
             }
         });
     }
