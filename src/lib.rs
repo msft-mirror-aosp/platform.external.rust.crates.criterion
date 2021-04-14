@@ -11,7 +11,7 @@
 //!
 //! ## Features:
 //! * Collects detailed statistics, providing strong confidence that changes
-//!   to performance are real, not measurement noise
+//!   to performance are real, not measurement noise.
 //! * Produces detailed charts, providing thorough understanding of your code's
 //!   performance behavior.
 
@@ -24,6 +24,8 @@
         clippy::just_underscores_and_digits, // Used in the stats code
         clippy::transmute_ptr_to_ptr, // Used in the stats code
         clippy::option_as_ref_deref, // Remove when MSRV bumped above 1.40
+        clippy::manual_non_exhaustive, // Remove when MSRV bumped above 1.40
+        clippy::match_like_matches_macro, // Remove when MSRV bumped above 1.42
     )
 )]
 
@@ -54,6 +56,8 @@ mod analysis;
 mod benchmark;
 #[macro_use]
 mod benchmark_group;
+pub mod async_executor;
+mod bencher;
 mod connection;
 mod csv_report;
 mod error;
@@ -73,14 +77,15 @@ mod stats;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::default::Default;
+use std::env;
 use std::fmt;
 use std::iter::IntoIterator;
 use std::marker::PhantomData;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
-use std::time::Instant;
 
 use criterion_plot::{Version, VersionError};
 
@@ -96,6 +101,10 @@ use crate::profiler::{ExternalProfiler, Profiler};
 use crate::report::{BencherReport, CliReport, Report, ReportContext, Reports};
 use crate::routine::Function;
 
+#[cfg(feature = "async")]
+pub use crate::bencher::AsyncBencher;
+pub use crate::bencher::Bencher;
+#[allow(deprecated)]
 pub use crate::benchmark::{Benchmark, BenchmarkDefinition, ParameterizedBenchmark};
 pub use crate::benchmark_group::{BenchmarkGroup, BenchmarkId};
 
@@ -125,6 +134,20 @@ lazy_static! {
                 Some(Mutex::new(Connection::new(stream).ok()?))
             }
             Err(_) => None,
+        }
+    };
+    static ref DEFAULT_OUTPUT_DIRECTORY: PathBuf = {
+        // Set criterion home to (in descending order of preference):
+        // - $CRITERION_HOME (cargo-criterion sets this, but other users could as well)
+        // - $CARGO_TARGET_DIR/criterion
+        // - the cargo target dir from `cargo metadata`
+        // - ./target/criterion
+        if let Some(value) = env::var_os("CRITERION_HOME") {
+            PathBuf::from(value)
+        } else if let Some(path) = cargo_target_directory() {
+            path.join("criterion")
+        } else {
+            PathBuf::from("target/criterion")
         }
     };
 }
@@ -245,7 +268,7 @@ pub enum BatchSize {
 
     /// `NumIterations` fixes the batch size to a constant number, specified by the user. This
     /// allows the user to choose their own tradeoff between overhead and memory usage, but care must
-    /// be taken in tuning the batch size. In general, the measurement overhead of NumIterations
+    /// be taken in tuning the batch size. In general, the measurement overhead of `NumIterations`
     /// will be larger than that of `NumBatches`. Most benchmarks should use `SmallInput` or
     /// `LargeInput` instead.
     NumIterations(u64),
@@ -272,377 +295,6 @@ impl BatchSize {
     }
 }
 
-/// Timer struct used to iterate a benchmarked function and measure the runtime.
-///
-/// This struct provides different timing loops as methods. Each timing loop provides a different
-/// way to time a routine and each has advantages and disadvantages.
-///
-/// * If you want to do the iteration and measurement yourself (eg. passing the iteration count
-///   to a separate process), use `iter_custom`.
-/// * If your routine requires no per-iteration setup and returns a value with an expensive `drop`
-///   method, use `iter_with_large_drop`.
-/// * If your routine requires some per-iteration setup that shouldn't be timed, use `iter_batched`
-///   or `iter_batched_ref`. See [`BatchSize`](enum.BatchSize.html) for a discussion of batch sizes.
-///   If the setup value implements `Drop` and you don't want to include the `drop` time in the
-///   measurement, use `iter_batched_ref`, otherwise use `iter_batched`. These methods are also
-///   suitable for benchmarking routines which return a value with an expensive `drop` method,
-///   but are more complex than `iter_with_large_drop`.
-/// * Otherwise, use `iter`.
-pub struct Bencher<'a, M: Measurement = WallTime> {
-    iterated: bool,         // have we iterated this benchmark?
-    iters: u64,             // Number of times to iterate this benchmark
-    value: M::Value,        // The measured value
-    measurement: &'a M,     // Reference to the measurement object
-    elapsed_time: Duration, // How much time did it take to perform the iteration? Used for the warmup period.
-}
-impl<'a, M: Measurement> Bencher<'a, M> {
-    /// Times a `routine` by executing it many times and timing the total elapsed time.
-    ///
-    /// Prefer this timing loop when `routine` returns a value that doesn't have a destructor.
-    ///
-    /// # Timing model
-    ///
-    /// Note that the `Bencher` also times the time required to destroy the output of `routine()`.
-    /// Therefore prefer this timing loop when the runtime of `mem::drop(O)` is negligible compared
-    /// to the runtime of the `routine`.
-    ///
-    /// ```text
-    /// elapsed = Instant::now + iters * (routine + mem::drop(O) + Range::next)
-    /// ```
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// #[macro_use] extern crate criterion;
-    ///
-    /// use criterion::*;
-    ///
-    /// // The function to benchmark
-    /// fn foo() {
-    ///     // ...
-    /// }
-    ///
-    /// fn bench(c: &mut Criterion) {
-    ///     c.bench_function("iter", move |b| {
-    ///         b.iter(|| foo())
-    ///     });
-    /// }
-    ///
-    /// criterion_group!(benches, bench);
-    /// criterion_main!(benches);
-    /// ```
-    ///
-    #[inline(never)]
-    pub fn iter<O, R>(&mut self, mut routine: R)
-    where
-        R: FnMut() -> O,
-    {
-        self.iterated = true;
-        let time_start = Instant::now();
-        let start = self.measurement.start();
-        for _ in 0..self.iters {
-            black_box(routine());
-        }
-        self.value = self.measurement.end(start);
-        self.elapsed_time = time_start.elapsed();
-    }
-
-    /// Times a `routine` by executing it many times and relying on `routine` to measure its own execution time.
-    ///
-    /// Prefer this timing loop in cases where `routine` has to do its own measurements to
-    /// get accurate timing information (for example in multi-threaded scenarios where you spawn
-    /// and coordinate with multiple threads).
-    ///
-    /// # Timing model
-    /// Custom, the timing model is whatever is returned as the Duration from `routine`.
-    ///
-    /// # Example
-    /// ```rust
-    /// #[macro_use] extern crate criterion;
-    /// use criterion::*;
-    /// use criterion::black_box;
-    /// use std::time::Instant;
-    ///
-    /// fn foo() {
-    ///     // ...
-    /// }
-    ///
-    /// fn bench(c: &mut Criterion) {
-    ///     c.bench_function("iter", move |b| {
-    ///         b.iter_custom(|iters| {
-    ///             let start = Instant::now();
-    ///             for _i in 0..iters {
-    ///                 black_box(foo());
-    ///             }
-    ///             start.elapsed()
-    ///         })
-    ///     });
-    /// }
-    ///
-    /// criterion_group!(benches, bench);
-    /// criterion_main!(benches);
-    /// ```
-    ///
-    #[inline(never)]
-    pub fn iter_custom<R>(&mut self, mut routine: R)
-    where
-        R: FnMut(u64) -> M::Value,
-    {
-        self.iterated = true;
-        let time_start = Instant::now();
-        self.value = routine(self.iters);
-        self.elapsed_time = time_start.elapsed();
-    }
-
-    #[doc(hidden)]
-    pub fn iter_with_setup<I, O, S, R>(&mut self, setup: S, routine: R)
-    where
-        S: FnMut() -> I,
-        R: FnMut(I) -> O,
-    {
-        self.iter_batched(setup, routine, BatchSize::PerIteration);
-    }
-
-    /// Times a `routine` by collecting its output on each iteration. This avoids timing the
-    /// destructor of the value returned by `routine`.
-    ///
-    /// WARNING: This requires `O(iters * mem::size_of::<O>())` of memory, and `iters` is not under the
-    /// control of the caller. If this causes out-of-memory errors, use `iter_batched` instead.
-    ///
-    /// # Timing model
-    ///
-    /// ``` text
-    /// elapsed = Instant::now + iters * (routine) + Iterator::collect::<Vec<_>>
-    /// ```
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// #[macro_use] extern crate criterion;
-    ///
-    /// use criterion::*;
-    ///
-    /// fn create_vector() -> Vec<u64> {
-    ///     # vec![]
-    ///     // ...
-    /// }
-    ///
-    /// fn bench(c: &mut Criterion) {
-    ///     c.bench_function("with_drop", move |b| {
-    ///         // This will avoid timing the Vec::drop.
-    ///         b.iter_with_large_drop(|| create_vector())
-    ///     });
-    /// }
-    ///
-    /// criterion_group!(benches, bench);
-    /// criterion_main!(benches);
-    /// ```
-    ///
-    pub fn iter_with_large_drop<O, R>(&mut self, mut routine: R)
-    where
-        R: FnMut() -> O,
-    {
-        self.iter_batched(|| (), |_| routine(), BatchSize::SmallInput);
-    }
-
-    #[doc(hidden)]
-    pub fn iter_with_large_setup<I, O, S, R>(&mut self, setup: S, routine: R)
-    where
-        S: FnMut() -> I,
-        R: FnMut(I) -> O,
-    {
-        self.iter_batched(setup, routine, BatchSize::NumBatches(1));
-    }
-
-    /// Times a `routine` that requires some input by generating a batch of input, then timing the
-    /// iteration of the benchmark over the input. See [`BatchSize`](enum.BatchSize.html) for
-    /// details on choosing the batch size. Use this when the routine must consume its input.
-    ///
-    /// For example, use this loop to benchmark sorting algorithms, because they require unsorted
-    /// data on each iteration.
-    ///
-    /// # Timing model
-    ///
-    /// ```text
-    /// elapsed = (Instant::now * num_batches) + (iters * (routine + O::drop)) + Vec::extend
-    /// ```
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// #[macro_use] extern crate criterion;
-    ///
-    /// use criterion::*;
-    ///
-    /// fn create_scrambled_data() -> Vec<u64> {
-    ///     # vec![]
-    ///     // ...
-    /// }
-    ///
-    /// // The sorting algorithm to test
-    /// fn sort(data: &mut [u64]) {
-    ///     // ...
-    /// }
-    ///
-    /// fn bench(c: &mut Criterion) {
-    ///     let data = create_scrambled_data();
-    ///
-    ///     c.bench_function("with_setup", move |b| {
-    ///         // This will avoid timing the to_vec call.
-    ///         b.iter_batched(|| data.clone(), |mut data| sort(&mut data), BatchSize::SmallInput)
-    ///     });
-    /// }
-    ///
-    /// criterion_group!(benches, bench);
-    /// criterion_main!(benches);
-    /// ```
-    ///
-    #[inline(never)]
-    pub fn iter_batched<I, O, S, R>(&mut self, mut setup: S, mut routine: R, size: BatchSize)
-    where
-        S: FnMut() -> I,
-        R: FnMut(I) -> O,
-    {
-        self.iterated = true;
-        let batch_size = size.iters_per_batch(self.iters);
-        assert!(batch_size != 0, "Batch size must not be zero.");
-        let time_start = Instant::now();
-        self.value = self.measurement.zero();
-
-        if batch_size == 1 {
-            for _ in 0..self.iters {
-                let input = black_box(setup());
-
-                let start = self.measurement.start();
-                let output = routine(input);
-                let end = self.measurement.end(start);
-                self.value = self.measurement.add(&self.value, &end);
-
-                drop(black_box(output));
-            }
-        } else {
-            let mut iteration_counter = 0;
-
-            while iteration_counter < self.iters {
-                let batch_size = ::std::cmp::min(batch_size, self.iters - iteration_counter);
-
-                let inputs = black_box((0..batch_size).map(|_| setup()).collect::<Vec<_>>());
-                let mut outputs = Vec::with_capacity(batch_size as usize);
-
-                let start = self.measurement.start();
-                outputs.extend(inputs.into_iter().map(&mut routine));
-                let end = self.measurement.end(start);
-                self.value = self.measurement.add(&self.value, &end);
-
-                black_box(outputs);
-
-                iteration_counter += batch_size;
-            }
-        }
-
-        self.elapsed_time = time_start.elapsed();
-    }
-
-    /// Times a `routine` that requires some input by generating a batch of input, then timing the
-    /// iteration of the benchmark over the input. See [`BatchSize`](enum.BatchSize.html) for
-    /// details on choosing the batch size. Use this when the routine should accept the input by
-    /// mutable reference.
-    ///
-    /// For example, use this loop to benchmark sorting algorithms, because they require unsorted
-    /// data on each iteration.
-    ///
-    /// # Timing model
-    ///
-    /// ```text
-    /// elapsed = (Instant::now * num_batches) + (iters * routine) + Vec::extend
-    /// ```
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// #[macro_use] extern crate criterion;
-    ///
-    /// use criterion::*;
-    ///
-    /// fn create_scrambled_data() -> Vec<u64> {
-    ///     # vec![]
-    ///     // ...
-    /// }
-    ///
-    /// // The sorting algorithm to test
-    /// fn sort(data: &mut [u64]) {
-    ///     // ...
-    /// }
-    ///
-    /// fn bench(c: &mut Criterion) {
-    ///     let data = create_scrambled_data();
-    ///
-    ///     c.bench_function("with_setup", move |b| {
-    ///         // This will avoid timing the to_vec call.
-    ///         b.iter_batched(|| data.clone(), |mut data| sort(&mut data), BatchSize::SmallInput)
-    ///     });
-    /// }
-    ///
-    /// criterion_group!(benches, bench);
-    /// criterion_main!(benches);
-    /// ```
-    ///
-    #[inline(never)]
-    pub fn iter_batched_ref<I, O, S, R>(&mut self, mut setup: S, mut routine: R, size: BatchSize)
-    where
-        S: FnMut() -> I,
-        R: FnMut(&mut I) -> O,
-    {
-        self.iterated = true;
-        let batch_size = size.iters_per_batch(self.iters);
-        assert!(batch_size != 0, "Batch size must not be zero.");
-        let time_start = Instant::now();
-        self.value = self.measurement.zero();
-
-        if batch_size == 1 {
-            for _ in 0..self.iters {
-                let mut input = black_box(setup());
-
-                let start = self.measurement.start();
-                let output = routine(&mut input);
-                let end = self.measurement.end(start);
-                self.value = self.measurement.add(&self.value, &end);
-
-                drop(black_box(output));
-                drop(black_box(input));
-            }
-        } else {
-            let mut iteration_counter = 0;
-
-            while iteration_counter < self.iters {
-                let batch_size = ::std::cmp::min(batch_size, self.iters - iteration_counter);
-
-                let mut inputs = black_box((0..batch_size).map(|_| setup()).collect::<Vec<_>>());
-                let mut outputs = Vec::with_capacity(batch_size as usize);
-
-                let start = self.measurement.start();
-                outputs.extend(inputs.iter_mut().map(&mut routine));
-                let end = self.measurement.end(start);
-                self.value = self.measurement.add(&self.value, &end);
-
-                black_box(outputs);
-
-                iteration_counter += batch_size;
-            }
-        }
-        self.elapsed_time = time_start.elapsed();
-    }
-
-    // Benchmarks must actually call one of the iter methods. This causes benchmarks to fail loudly
-    // if they don't.
-    fn assert_iterated(&mut self) {
-        if !self.iterated {
-            panic!("Benchmark function must call Bencher::iter or related method.");
-        }
-        self.iterated = false;
-    }
-}
-
 /// Baseline describes how the baseline_directory is handled.
 #[derive(Debug, Clone, Copy)]
 pub enum Baseline {
@@ -664,15 +316,23 @@ pub enum PlottingBackend {
     /// is not installed.
     Plotters,
 }
+impl PlottingBackend {
+    fn create_plotter(&self) -> Box<dyn Plotter> {
+        match self {
+            PlottingBackend::Gnuplot => Box::new(Gnuplot::default()),
+            PlottingBackend::Plotters => Box::new(PlottersBackend::default()),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 /// Enum representing the execution mode.
 pub(crate) enum Mode {
-    /// Run benchmarks normally
+    /// Run benchmarks normally.
     Benchmark,
     /// List all benchmarks but do not run them.
     List,
-    /// Run bennchmarks once to verify that they work, but otherwise do not measure them.
+    /// Run benchmarks once to verify that they work, but otherwise do not measure them.
     Test,
     /// Iterate benchmarks for a given length of time but do not analyze or report on them.
     Profile(Duration),
@@ -696,16 +356,14 @@ impl Mode {
 /// the new load
 /// - **Measurement**: The routine is repeatedly executed, and timing information is collected into
 /// a sample
-/// - **Analysis**: The sample is analyzed and distiled into meaningful statistics that get
+/// - **Analysis**: The sample is analyzed and distilled into meaningful statistics that get
 /// reported to stdout, stored in files, and plotted
 /// - **Comparison**: The current sample is compared with the sample obtained in the previous
 /// benchmark.
 pub struct Criterion<M: Measurement = WallTime> {
     config: BenchmarkConfig,
-    plotting_backend: PlottingBackend,
-    plotting_enabled: bool,
     filter: Option<Regex>,
-    report: Box<dyn Report>,
+    report: Reports,
     output_directory: PathBuf,
     baseline_directory: String,
     baseline: Baseline,
@@ -716,6 +374,26 @@ pub struct Criterion<M: Measurement = WallTime> {
     profiler: Box<RefCell<dyn Profiler>>,
     connection: Option<MutexGuard<'static, Connection>>,
     mode: Mode,
+}
+
+/// Returns the Cargo target directory, possibly calling `cargo metadata` to
+/// figure it out.
+fn cargo_target_directory() -> Option<PathBuf> {
+    #[derive(Deserialize)]
+    struct Metadata {
+        target_directory: PathBuf,
+    }
+
+    env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let output = Command::new(env::var_os("CARGO")?)
+                .args(&["metadata", "--format-version", "1"])
+                .output()
+                .ok()?;
+            let metadata: Metadata = serde_json::from_slice(&output.stdout).ok()?;
+            Some(metadata.target_directory)
+        })
 }
 
 impl Default for Criterion {
@@ -731,25 +409,18 @@ impl Default for Criterion {
     /// - Plotting: enabled, using gnuplot if available or plotters if gnuplot is not available
     /// - No filter
     fn default() -> Criterion {
-        let mut reports: Vec<Box<dyn Report>> = vec![];
-        if CARGO_CRITERION_CONNECTION.is_none() {
-            reports.push(Box::new(CliReport::new(false, false, false)));
-        }
-        reports.push(Box::new(FileCsvReport));
-
-        // Set criterion home to (in descending order of preference):
-        // - $CRITERION_HOME (cargo-criterion sets this, but other users could as well)
-        // - $CARGO_TARGET_DIR/criterion
-        // - ./target/criterion
-        let output_directory = if let Some(value) = std::env::var_os("CRITERION_HOME") {
-            PathBuf::from(value)
-        } else if let Some(value) = std::env::var_os("CARGO_TARGET_DIR") {
-            PathBuf::from(value).join("criterion")
-        } else {
-            PathBuf::from("target/criterion")
+        let reports = Reports {
+            cli_enabled: true,
+            cli: CliReport::new(false, false, false),
+            bencher_enabled: false,
+            bencher: BencherReport,
+            html_enabled: true,
+            html: Html::new(DEFAULT_PLOTTING_BACKEND.create_plotter()),
+            csv_enabled: true,
+            csv: FileCsvReport,
         };
 
-        Criterion {
+        let mut criterion = Criterion {
             config: BenchmarkConfig {
                 confidence_level: 0.95,
                 measurement_time: Duration::new(5, 0),
@@ -760,14 +431,12 @@ impl Default for Criterion {
                 warm_up_time: Duration::new(3, 0),
                 sampling_mode: SamplingMode::Auto,
             },
-            plotting_backend: *DEFAULT_PLOTTING_BACKEND,
-            plotting_enabled: true,
             filter: None,
-            report: Box::new(Reports::new(reports)),
+            report: reports,
             baseline_directory: "base".to_owned(),
             baseline: Baseline::Save,
             load_baseline: None,
-            output_directory,
+            output_directory: DEFAULT_OUTPUT_DIRECTORY.clone(),
             all_directories: HashSet::new(),
             all_titles: HashSet::new(),
             measurement: WallTime,
@@ -776,7 +445,16 @@ impl Default for Criterion {
                 .as_ref()
                 .map(|mtx| mtx.lock().unwrap()),
             mode: Mode::Benchmark,
+        };
+
+        if criterion.connection.is_some() {
+            // disable all reports when connected to cargo-criterion; it will do the reporting.
+            criterion.report.cli_enabled = false;
+            criterion.report.bencher_enabled = false;
+            criterion.report.csv_enabled = false;
+            criterion.report.html_enabled = false;
         }
+        criterion
     }
 }
 
@@ -787,8 +465,6 @@ impl<M: Measurement> Criterion<M> {
         // Can't use struct update syntax here because they're technically different types.
         Criterion {
             config: self.config,
-            plotting_backend: self.plotting_backend,
-            plotting_enabled: self.plotting_enabled,
             filter: self.filter,
             report: self.report,
             baseline_directory: self.baseline_directory,
@@ -817,17 +493,15 @@ impl<M: Measurement> Criterion<M> {
     /// if not.
     ///
     /// Panics if `backend` is `PlottingBackend::Gnuplot` and gnuplot is not available.
-    pub fn plotting_backend(self, backend: PlottingBackend) -> Criterion<M> {
+    pub fn plotting_backend(mut self, backend: PlottingBackend) -> Criterion<M> {
         if let PlottingBackend::Gnuplot = backend {
             if GNUPLOT_VERSION.is_err() {
                 panic!("Gnuplot plotting backend was requested, but gnuplot is not available. To continue, either install Gnuplot or allow Criterion.rs to fall back to using plotters.");
             }
         }
 
-        Criterion {
-            plotting_backend: backend,
-            ..self
-        }
+        self.report.html = Html::new(backend.create_plotter());
+        self
     }
 
     /// Changes the default size of the sample for benchmarks run with this runner.
@@ -944,7 +618,7 @@ impl<M: Measurement> Criterion<M> {
     /// noise.
     ///
     /// This presents a trade-off. By setting the significance level closer to 0.0, you can increase
-    /// the statistical robustness against noise, but it also weaken's Criterion.rs' ability to
+    /// the statistical robustness against noise, but it also weakens Criterion.rs' ability to
     /// detect small but real changes in the performance. By setting the significance level
     /// closer to 1.0, Criterion.rs will be more able to detect small true changes, but will also
     /// report more spurious differences.
@@ -961,40 +635,26 @@ impl<M: Measurement> Criterion<M> {
         self
     }
 
-    fn create_plotter(&self) -> Box<dyn Plotter> {
-        match self.plotting_backend {
-            PlottingBackend::Gnuplot => Box::new(Gnuplot::default()),
-            PlottingBackend::Plotters => Box::new(PlottersBackend::default()),
-        }
-    }
-
     /// Enables plotting
     pub fn with_plots(mut self) -> Criterion<M> {
-        self.plotting_enabled = true;
-        let mut reports: Vec<Box<dyn Report>> = vec![];
+        // If running under cargo-criterion then don't re-enable the reports; let it do the reporting.
         if self.connection.is_none() {
-            reports.push(Box::new(CliReport::new(false, false, false)));
+            self.report.html_enabled = true;
         }
-        reports.push(Box::new(FileCsvReport));
-        reports.push(Box::new(Html::new(self.create_plotter())));
-        self.report = Box::new(Reports::new(reports));
-
         self
     }
 
     /// Disables plotting
     pub fn without_plots(mut self) -> Criterion<M> {
-        self.plotting_enabled = false;
-        let mut reports: Vec<Box<dyn Report>> = vec![];
-        if self.connection.is_none() {
-            reports.push(Box::new(CliReport::new(false, false, false)));
-        }
-        reports.push(Box::new(FileCsvReport));
-        self.report = Box::new(Reports::new(reports));
+        self.report.html_enabled = false;
         self
     }
 
     /// Return true if generation of the plots is possible.
+    #[deprecated(
+        since = "0.3.4",
+        note = "No longer useful; since the plotters backend is available Criterion.rs can always generate plots"
+    )]
     pub fn can_plot(&self) -> bool {
         // Trivially true now that we have plotters.
         // TODO: Deprecate and remove this.
@@ -1027,6 +687,13 @@ impl<M: Measurement> Criterion<M> {
         });
         self.filter = Some(filter);
 
+        self
+    }
+
+    /// Override whether the CLI output will be colored or not. Usually you would use the `--color`
+    /// CLI argument, but this is available for programmmatic use as well.
+    pub fn with_output_color(mut self, enabled: bool) -> Criterion<M> {
+        self.report.cli.enable_text_coloring = enabled;
         self
     }
 
@@ -1179,6 +846,9 @@ Criterion.rs will output more debug information and will save the gnuplot
 scripts alongside the generated plots.
 
 To test that the benchmarks work, run `cargo test --benches`
+
+NOTE: If you see an 'unrecognized option' error using any of the options above, see:
+https://bheisler.github.io/criterion.rs/book/faq.html
 ")
             .get_matches();
 
@@ -1277,10 +947,16 @@ To test that the benchmarks work, run `cargo test --benches`
 
         if self.connection.is_some() {
             // disable all reports when connected to cargo-criterion; it will do the reporting.
-            self.report = Box::new(Reports::new(vec![]));
+            self.report.cli_enabled = false;
+            self.report.bencher_enabled = false;
+            self.report.csv_enabled = false;
+            self.report.html_enabled = false;
         } else {
-            let cli_report: Box<dyn Report> = match matches.value_of("output-format") {
-                Some("bencher") => Box::new(BencherReport),
+            match matches.value_of("output-format") {
+                Some("bencher") => {
+                    self.report.bencher_enabled = true;
+                    self.report.cli_enabled = false;
+                }
                 _ => {
                     let verbose = matches.is_present("verbose");
                     let stdout_isatty = atty::is(atty::Stream::Stdout);
@@ -1296,21 +972,12 @@ To test that the benchmarks work, run `cargo test --benches`
                         }
                         _ => enable_text_coloring = stdout_isatty,
                     };
-                    Box::new(CliReport::new(
-                        enable_text_overwrite,
-                        enable_text_coloring,
-                        verbose,
-                    ))
+                    self.report.bencher_enabled = false;
+                    self.report.cli_enabled = true;
+                    self.report.cli =
+                        CliReport::new(enable_text_overwrite, enable_text_coloring, verbose);
                 }
             };
-
-            let mut reports: Vec<Box<dyn Report>> = vec![];
-            reports.push(cli_report);
-            reports.push(Box::new(FileCsvReport));
-            if self.plotting_enabled {
-                reports.push(Box::new(Html::new(self.create_plotter())));
-            }
-            self.report = Box::new(Reports::new(reports));
         }
 
         if let Some(dir) = matches.value_of("load-baseline") {
@@ -1502,9 +1169,14 @@ where
     where
         F: FnMut(&mut Bencher<'_, M>, &I),
     {
-        // Guaranteed safe because external callers can't create benchmark IDs without a function
-        // name or parameter
-        let group_name = id.function_name.unwrap();
+        // It's possible to use BenchmarkId::from_parameter to create a benchmark ID with no function
+        // name. That's intended for use with BenchmarkGroups where the function name isn't necessary,
+        // but here it is.
+        let group_name = id.function_name.expect(
+            "Cannot use BenchmarkId::from_parameter with Criterion::bench_with_input. \
+                 Consider using a BenchmarkGroup or BenchmarkId::new instead.",
+        );
+        // Guaranteed safe because external callers can't create benchmark IDs without a parameter
         let parameter = id.parameter.unwrap();
         self.benchmark_group(group_name).bench_with_input(
             BenchmarkId::no_function_with_input(parameter),
@@ -1537,7 +1209,9 @@ where
     /// criterion_group!(benches, bench);
     /// criterion_main!(benches);
     /// ```
-    #[doc(hidden)] // Soft-deprecated, use benchmark groups instead
+    #[doc(hidden)]
+    #[deprecated(since = "0.3.4", note = "Please use BenchmarkGroups instead.")]
+    #[allow(deprecated)]
     pub fn bench_function_over_inputs<I, F>(
         &mut self,
         id: &str,
@@ -1588,7 +1262,9 @@ where
     /// criterion_group!(benches, bench);
     /// criterion_main!(benches);
     /// ```
-    #[doc(hidden)] // Soft-deprecated, use benchmark groups instead
+    #[doc(hidden)]
+    #[deprecated(since = "0.3.4", note = "Please use BenchmarkGroups instead.")]
+    #[allow(deprecated)]
     pub fn bench_functions<I>(
         &mut self,
         id: &str,
@@ -1631,7 +1307,8 @@ where
     /// criterion_group!(benches, bench);
     /// criterion_main!(benches);
     /// ```
-    #[doc(hidden)] // Soft-deprecated, use benchmark groups instead
+    #[doc(hidden)]
+    #[deprecated(since = "0.3.4", note = "Please use BenchmarkGroups instead.")]
     pub fn bench<B: BenchmarkDefinition<M>>(
         &mut self,
         group_id: &str,
@@ -1786,7 +1463,7 @@ impl ActualSamplingMode {
                 let m_ns = target_time.to_nanos();
                 // Solve: [d + 2*d + 3*d + ... + n*d] * met = m_ns
                 let total_runs = n * (n + 1) / 2;
-                let d = (m_ns as f64 / met / total_runs as f64).ceil() as u64;
+                let d = ((m_ns as f64 / met / total_runs as f64).ceil() as u64).max(1);
                 let expected_ns = total_runs as f64 * d as f64 * met;
 
                 if d == 1 {
@@ -1802,7 +1479,7 @@ impl ActualSamplingMode {
                             recommended_sample_size
                         );
                     } else {
-                        println!("or enable flat sampling.");
+                        println!(" or enable flat sampling.");
                     }
                 }
 
@@ -1814,7 +1491,7 @@ impl ActualSamplingMode {
                 let m_ns = target_time.to_nanos() as f64;
                 let time_per_sample = m_ns / (n as f64);
                 // This is pretty simplistic; we could do something smarter to fit into the allotted time.
-                let iterations_per_sample = (time_per_sample / met).ceil() as u64;
+                let iterations_per_sample = ((time_per_sample / met).ceil() as u64).max(1);
 
                 let expected_ns = met * (iterations_per_sample * n) as f64;
 
@@ -1896,4 +1573,54 @@ pub fn runner(benches: &[&dyn Fn()]) {
         bench();
     }
     Criterion::default().configure_from_args().final_summary();
+}
+
+/// Print a warning informing users about upcoming changes to features
+#[cfg(not(feature = "html_reports"))]
+#[doc(hidden)]
+pub fn __warn_about_html_reports_feature() {
+    if CARGO_CRITERION_CONNECTION.is_none() {
+        println!(
+            "WARNING: HTML report generation will become a non-default optional feature in Criterion.rs 0.4.0."
+        );
+        println!(
+            "This feature is being moved to cargo-criterion \
+            (https://github.com/bheisler/cargo-criterion) and will be optional in a future \
+            version of Criterion.rs. To silence this warning, either switch to cargo-criterion or \
+            enable the 'html_reports' feature in your Cargo.toml."
+        );
+        println!();
+    }
+}
+
+/// Print a warning informing users about upcoming changes to features
+#[cfg(feature = "html_reports")]
+#[doc(hidden)]
+pub fn __warn_about_html_reports_feature() {
+    // They have the feature enabled, so they're ready for the update.
+}
+
+/// Print a warning informing users about upcoming changes to features
+#[cfg(not(feature = "cargo_bench_support"))]
+#[doc(hidden)]
+pub fn __warn_about_cargo_bench_support_feature() {
+    if CARGO_CRITERION_CONNECTION.is_none() {
+        println!(
+            "WARNING: In Criterion.rs 0.4.0, running criterion benchmarks outside of cargo-criterion will become a default optional feature."
+        );
+        println!(
+            "The statistical analysis and reporting is being moved to cargo-criterion \
+            (https://github.com/bheisler/cargo-criterion) and will be optional in a future \
+            version of Criterion.rs. To silence this warning, either switch to cargo-criterion or \
+            enable the 'cargo_bench_support' feature in your Cargo.toml."
+        );
+        println!();
+    }
+}
+
+/// Print a warning informing users about upcoming changes to features
+#[cfg(feature = "cargo_bench_support")]
+#[doc(hidden)]
+pub fn __warn_about_cargo_bench_support_feature() {
+    // They have the feature enabled, so they're ready for the update.
 }
