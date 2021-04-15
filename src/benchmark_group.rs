@@ -3,6 +3,7 @@ use crate::benchmark::PartialBenchmarkConfig;
 use crate::connection::OutgoingMessage;
 use crate::measurement::Measurement;
 use crate::report::BenchmarkId as InternalBenchmarkId;
+use crate::report::Report;
 use crate::report::ReportContext;
 use crate::routine::{Function, Routine};
 use crate::{Bencher, Criterion, DurationExt, Mode, PlotConfiguration, SamplingMode, Throughput};
@@ -198,7 +199,7 @@ impl<'a, M: Measurement> BenchmarkGroup<'a, M> {
     /// noise.
     ///
     /// This presents a trade-off. By setting the significance level closer to 0.0, you can increase
-    /// the statistical robustness against noise, but it also weaken's Criterion.rs' ability to
+    /// the statistical robustness against noise, but it also weakens Criterion.rs' ability to
     /// detect small but real changes in the performance. By setting the significance level
     /// closer to 1.0, Criterion.rs will be more able to detect small true changes, but will also
     /// report more spurious differences.

@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use criterion;
 use serde_json;
 
@@ -483,6 +485,15 @@ fn test_benchmark_group_without_input() {
     group.bench_function("Test 1", |b| b.iter(|| 30));
     group.bench_function("Test 2", |b| b.iter(|| 20));
     group.finish();
+}
+
+#[test]
+fn test_criterion_doesnt_panic_if_measured_time_is_zero() {
+    let dir = temp_dir();
+    let mut c = short_benchmark(&dir);
+    c.bench_function("zero_time", |bencher| {
+        bencher.iter_custom(|_iters| Duration::new(0, 0))
+    });
 }
 
 mod macros {
