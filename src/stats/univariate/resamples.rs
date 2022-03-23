@@ -70,9 +70,7 @@ mod test {
 
     // Check that the resample is a subset of the sample
     quickcheck! {
-        fn subset(size: u8, nresamples: u8) -> TestResult {
-            let size = size as usize;
-            let nresamples = nresamples as usize;
+        fn subset(size: usize, nresamples: usize) -> TestResult {
             if size > 1 {
                 let v: Vec<_> = (0..size).map(|i| i as f32).collect();
                 let sample = Sample::new(&v);
