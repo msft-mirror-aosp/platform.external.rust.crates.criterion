@@ -53,7 +53,7 @@ rust_library {
     rustlibs: [
         "libatty",
         "libcast",
-        "libclap",
+        "libclap_deprecated",
         "libcriterion_plot",
         "libcsv",
         "libitertools",
