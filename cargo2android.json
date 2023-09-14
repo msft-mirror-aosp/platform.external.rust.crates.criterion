@@ -1,5 +1,7 @@
 {
-  "patch": "patches/Android.bp.diff",
   "device": true,
-  "run": true
+  "run": true,
+  "dep-suffixes": {
+    "clap": "_3.2.23"
+  }
 }
