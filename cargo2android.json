@@ -1,7 +1,0 @@
-{
-  "device": true,
-  "run": true,
-  "dep-suffixes": {
-    "clap": "_3.2.23"
-  }
-}
